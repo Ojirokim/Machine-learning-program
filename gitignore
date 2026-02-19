@@ -1,0 +1,36 @@
+
+# ============================
+# ML Workflow Wizard - .gitignore
+# ============================
+
+# Output artifacts
+prep_out/
+*.joblib
+report.json
+run_config.json
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# IDE settings
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
