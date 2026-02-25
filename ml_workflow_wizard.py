@@ -114,11 +114,31 @@ def ask_choice(prompt: str, options: List[str], default_index: int = 0) -> int:
 
 
 def is_id_like(col: str, s: pd.Series, n_rows: int) -> bool:
-    name_flag = bool(re.search(r"\b(id|uuid|guid|user|participant|account|customer|record)\b", col, re.I))
+    """Heuristic: detect columns that are likely identifiers (good to drop from features).
+    We keep this conservative: it only *suggests* dropping; user still confirms.
+    """
+    # Name-based hints
+    name_flag = bool(re.search(r"\b(id|uuid|guid|user|participant|account|customer|record)\b", str(col), re.I))
+
+    # Uniqueness-based hints
     nunique = int(s.nunique(dropna=True))
     uniq_ratio = nunique / max(n_rows, 1)
     uniq_flag = (uniq_ratio >= 0.95) and (nunique >= max(50, int(0.5 * n_rows)))
-    return bool(name_flag or uniq_flag)
+
+    # Sequence-like numeric IDs (monotonic, mostly integers)
+    seq_flag = False
+    if pd.api.types.is_numeric_dtype(s):
+        ss = s.dropna()
+        if len(ss) >= 50:
+            # integer-ish
+            as_int = ss.astype("float64").round().astype("int64")
+            intish = float((np.abs(ss.astype("float64") - as_int.astype("float64")) < 1e-9).mean()) >= 0.98
+            if intish and (as_int.is_monotonic_increasing or as_int.is_monotonic_decreasing) and (as_int.nunique() / max(len(as_int), 1) >= 0.95):
+                seq_flag = True
+
+    return bool(name_flag or uniq_flag or seq_flag)
+
+
 
 
 def is_constant_like(s: pd.Series) -> bool:
@@ -128,6 +148,7 @@ def is_constant_like(s: pd.Series) -> bool:
 
 
 def numeric_like_object(s: pd.Series) -> Tuple[bool, float]:
+    """Simple numeric-like detection for object columns (no cleaning)."""
     if s.dtype != "object":
         return False, 0.0
     ss = s.dropna().astype(str).str.strip()
@@ -138,9 +159,125 @@ def numeric_like_object(s: pd.Series) -> Tuple[bool, float]:
     return bool(rate >= 0.85), rate
 
 
+_CURRENCY_TOKENS = [
+    "₩", "원", "krw", "won",
+    "$", "usd", "dollar", "달러",
+    "€", "eur",
+    "£", "gbp",
+    "¥", "jpy", "엔",
+]
+
+
+def _clean_messy_number_str(x: str, percent_as_fraction: bool) -> str:
+    """Best-effort cleaning for real-world numeric strings.
+    Handles commas, spaces, currency/unit tokens, and parentheses negatives.
+    """
+    s = x.strip()
+    if not s:
+        return s
+
+    # Parentheses for negative numbers: (1,234) -> -1234
+    neg = False
+    if s.startswith("(") and s.endswith(")"):
+        neg = True
+        s = s[1:-1].strip()
+
+    # Remove common currency/unit tokens (case-insensitive)
+    low = s.lower()
+    for tok in _CURRENCY_TOKENS:
+        low = low.replace(tok.lower(), "")
+    s = low
+
+    # Remove thousands separators and spaces
+    s = s.replace(",", "").replace(" ", "")
+
+    # Handle percent
+    is_pct = "%" in s
+    s = s.replace("%", "")
+
+    # Keep only digits, sign, dot (.)
+    s = re.sub(r"[^0-9+\-\.]", "", s)
+
+    if neg and s and not s.startswith("-"):
+        s = "-" + s
+
+    # Convert percent to fraction if requested (done later via /100, but we mark here)
+    if is_pct and percent_as_fraction and s:
+        return f"{s}__PCT__"
+    return s
+
+
+def parse_messy_numeric_series(s: pd.Series, percent_as_fraction: bool = True) -> Tuple[pd.Series, float, Dict[str, Any]]:
+    """Parse messy numeric strings (e.g., '10,000', '1000원', '$1,234', '12%').
+    Returns (numeric_series, parse_rate, details).
+    """
+    if s.dtype != "object":
+        out = pd.to_numeric(s, errors="coerce")
+        return out, float(out.notna().mean()), {"method": "to_numeric_non_object"}
+
+    ss = s.astype("object")
+    cleaned = ss.apply(lambda v: _clean_messy_number_str(str(v), percent_as_fraction) if pd.notna(v) else v)
+
+    def _to_num(v):
+        if pd.isna(v):
+            return np.nan
+        st = str(v)
+        if st.endswith("__PCT__"):
+            base = st[:-7]
+            num = pd.to_numeric(base, errors="coerce")
+            return (num / 100.0) if pd.notna(num) else np.nan
+        return pd.to_numeric(st, errors="coerce")
+
+    out = cleaned.apply(_to_num)
+    rate = float(out.notna().mean())
+
+    details = {
+        "method": "messy_numeric_clean",
+        "percent_as_fraction": percent_as_fraction,
+        "sample_raw": s.dropna().astype(str).head(8).tolist(),
+        "sample_cleaned": cleaned.dropna().astype(str).head(8).tolist(),
+    }
+    return out, rate, details
+
+
+def messy_numeric_like_object(s: pd.Series, percent_as_fraction: bool = True) -> Tuple[bool, float, Dict[str, Any]]:
+    """Detect + estimate parse rate for messy numeric text columns."""
+    if s.dtype != "object":
+        return False, 0.0, {"reason": "not_object"}
+    ss = s.dropna().astype(str)
+    if ss.empty:
+        return False, 0.0, {"reason": "empty"}
+    _, rate, details = parse_messy_numeric_series(s, percent_as_fraction=percent_as_fraction)
+    return bool(rate >= 0.80), rate, details
+
+
+def date_like_object(s: pd.Series, dayfirst: bool = False) -> Tuple[bool, float, Dict[str, Any]]:
+    """Detect date-like object columns by trying to parse a sample."""
+    if s.dtype != "object":
+        return False, 0.0, {"reason": "not_object"}
+    ss = s.dropna().astype(str).str.strip()
+    if ss.empty:
+        return False, 0.0, {"reason": "empty"}
+
+    sample = ss.sample(min(len(ss), 200), random_state=42) if len(ss) > 200 else ss
+    dt = pd.to_datetime(sample, errors="coerce", infer_datetime_format=True, dayfirst=dayfirst)
+    rate = float(dt.notna().mean())
+
+    slash_rate = float(sample.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$").mean())
+    amb = bool(slash_rate >= 0.25)
+
+    details = {
+        "method": "to_datetime_sample",
+        "dayfirst": dayfirst,
+        "sample_raw": sample.head(8).tolist(),
+        "parse_rate": rate,
+        "ambiguous_slash_rate": slash_rate,
+    }
+    return bool(rate >= 0.80), rate, {"ambiguous": amb, **details}
+
+
 def normalize_text_series(s: pd.Series) -> pd.Series:
     return s.apply(lambda x: x.strip() if isinstance(x, str) else x)
-
 
 def detect_outcome_like_columns(df: pd.DataFrame, target: str) -> List[str]:
     KEYWORDS = [
@@ -449,6 +586,507 @@ class Report:
     stability_cv_n: Optional[int] = None
 
 
+def run_dataprep_optimized(df: pd.DataFrame, csv_path: str, outdir: Path) -> Tuple[pd.DataFrame, Path, Dict[str, Any]]:
+    """
+    Optimized DataPrep:
+      - Modes: quick / standard / strict
+      - Batch decisions (drop candidates, numeric parsing, date parsing)
+      - Confidence-based prompting
+      - Save + reuse cleaning_config.json to avoid repeated prompts
+    Returns: (cleaned_df, cleaned_csv_path, cleaning_report_dict)
+    """
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    config_path = outdir / "cleaning_config.json"
+    report_path = outdir / "cleaning_report.json"
+    steps_path = outdir / "cleaning_steps.py"
+
+    # ---------- Reuse config ----------
+    if config_path.exists():
+        if ask_yes_no(f"\n[DataPrep] Found previous config at {config_path}. Reuse it to clean this CSV automatically?", default=True):
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            protected_cols = set(cfg.get("protected_cols", []))
+            high_missing_threshold = float(cfg.get("high_missing_threshold", 0.60))
+            drop_duplicates = bool(cfg.get("drop_duplicates", False))
+            drop_cols = list(cfg.get("drop_cols", []))
+            normalize_text = bool(cfg.get("normalize_text", True))
+
+            numeric_plan = cfg.get("numeric_parse", {}) or {}
+            date_plan = cfg.get("date_parse", {}) or {}
+
+            cleaned = df.copy()
+            input_shape = list(cleaned.shape)
+
+            if drop_duplicates:
+                cleaned = cleaned.drop_duplicates()
+
+            if drop_cols:
+                cleaned = cleaned.drop(columns=[c for c in drop_cols if c in cleaned.columns], errors="ignore")
+
+            # Normalize text
+            if normalize_text:
+                for c in [c for c in cleaned.columns if cleaned[c].dtype == "object"]:
+                    cleaned[c] = normalize_text_series(cleaned[c])
+
+            # Numeric parsing plan
+            percent_as_fraction = bool(numeric_plan.get("percent_as_fraction", True))
+            numeric_cols = list(numeric_plan.get("cols", []))
+            for c in numeric_cols:
+                if c in cleaned.columns and cleaned[c].dtype == "object":
+                    parsed, _, _ = parse_messy_numeric_series(cleaned[c], percent_as_fraction=percent_as_fraction)
+                    cleaned[c] = parsed
+
+            # Date parsing plan
+            store_dates_as_iso = bool(date_plan.get("store_as_iso", True))
+            dayfirst_cols = set(date_plan.get("dayfirst_cols", []))
+            date_cols = list(date_plan.get("cols", []))
+            for c in date_cols:
+                if c in cleaned.columns and cleaned[c].dtype == "object":
+                    dt = pd.to_datetime(cleaned[c].astype(str).str.strip(), errors="coerce", infer_datetime_format=True, dayfirst=(c in dayfirst_cols))
+                    if store_dates_as_iso:
+                        has_time = dt.dropna().astype(str).str.contains(r":\d{2}", regex=True).any()
+                        fmt = "%Y-%m-%d %H:%M:%S" if has_time else "%Y-%m-%d"
+                        cleaned[c] = dt.dt.strftime(fmt)
+                    else:
+                        cleaned[c] = dt
+
+            cleaned_csv = outdir / "cleaned.csv"
+            cleaned.to_csv(cleaned_csv, index=False)
+
+            report = {
+                "input_csv": csv_path,
+                "output_csv": str(cleaned_csv),
+                "input_shape": input_shape,
+                "output_shape": list(cleaned.shape),
+                "reused_config": True,
+                "protected_cols": sorted(list(protected_cols)),
+                "high_missing_threshold": high_missing_threshold,
+                "drop_duplicates": drop_duplicates,
+                "dropped_columns": drop_cols,
+                "normalize_text": normalize_text,
+                "numeric_parse": numeric_plan,
+                "date_parse": date_plan,
+            }
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+            # Small script for learning/debugging
+            steps = [
+                "# cleaning_steps.py (auto-generated from cleaning_config.json)",
+                "import pandas as pd",
+                "import numpy as np",
+                "import re",
+                "",
+                f"df = pd.read_csv({csv_path!r})",
+            ]
+            if drop_duplicates:
+                steps.append("df = df.drop_duplicates()")
+            if drop_cols:
+                steps.append(f"df = df.drop(columns={drop_cols!r}, errors='ignore')")
+            if normalize_text:
+                steps.append("# normalize text columns (strip spaces)")
+                steps.append("for c in df.select_dtypes(include=['object']).columns:")
+                steps.append("    df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)")
+            if numeric_cols:
+                steps.append("# numeric parsing for messy numeric strings")
+                steps.append(f"_PCT_AS_FRACTION = {percent_as_fraction!r}")
+                steps.append("_CURRENCY_TOKENS = ['₩','원','krw','won','$','usd','dollar','달러','€','eur','£','gbp','¥','jpy','엔']")
+                steps.append("def _clean_num(x: str) -> str:")
+                steps.append("    s = x.strip()")
+                steps.append("    if not s: return s")
+                steps.append("    neg = False")
+                steps.append("    if s.startswith('(') and s.endswith(')'):")
+                steps.append("        neg = True; s = s[1:-1].strip()")
+                steps.append("    low = s.lower()")
+                steps.append("    for tok in _CURRENCY_TOKENS:")
+                steps.append("        low = low.replace(tok.lower(), '')")
+                steps.append("    s = low.replace(',', '').replace(' ', '')")
+                steps.append("    is_pct = '%' in s")
+                steps.append("    s = s.replace('%','')")
+                steps.append("    s = re.sub(r'[^0-9+\\-\\.]', '', s)")
+                steps.append("    if neg and s and not s.startswith('-'): s='-'+s")
+                steps.append("    if is_pct and _PCT_AS_FRACTION and s: return s+'__PCT__'")
+                steps.append("    return s")
+                steps.append("def _to_num(v):")
+                steps.append("    if pd.isna(v): return np.nan")
+                steps.append("    st = _clean_num(str(v))")
+                steps.append("    if st.endswith('__PCT__'):")
+                steps.append("        base = st[:-7]")
+                steps.append("        num = pd.to_numeric(base, errors='coerce')")
+                steps.append("        return (num/100.0) if pd.notna(num) else np.nan")
+                steps.append("    return pd.to_numeric(st, errors='coerce')")
+                for c in numeric_cols:
+                    steps.append(f"df[{c!r}] = df[{c!r}].apply(_to_num)")
+            if date_cols:
+                steps.append("# date parsing")
+                steps.append(f"_STORE_AS_ISO = {store_dates_as_iso!r}")
+                steps.append(f"_DAYFIRST_COLS = {sorted(list(dayfirst_cols))!r}")
+                steps.append("for c in " + repr(date_cols) + ":")
+                steps.append("    dt = pd.to_datetime(df[c].astype(str).str.strip(), errors='coerce', infer_datetime_format=True, dayfirst=(c in _DAYFIRST_COLS))")
+                steps.append("    if _STORE_AS_ISO:")
+                steps.append("        has_time = dt.dropna().astype(str).str.contains(r':\\d{2}', regex=True).any()")
+                steps.append("        fmt = '%Y-%m-%d %H:%M:%S' if has_time else '%Y-%m-%d'")
+                steps.append("        df[c] = dt.dt.strftime(fmt)")
+                steps.append("    else:")
+                steps.append("        df[c] = dt")
+            steps.append(f"df.to_csv({str(cleaned_csv)!r}, index=False)")
+            steps_path.write_text("\n".join(steps) + "\n", encoding="utf-8")
+
+            print("\n[DataPrep] Reused config. Saved cleaned CSV:", cleaned_csv)
+            return cleaned, cleaned_csv, report
+
+    # ---------- Mode selection ----------
+    mode_idx = ask_choice(
+        "\n[DataPrep] Choose cleaning mode (controls how many prompts you get):",
+        [
+            "Quick (auto-apply safe fixes, minimal prompts)",
+            "Standard (recommended: batch prompts + safe defaults)",
+            "Strict (ask more before destructive changes)",
+        ],
+        default_index=1,
+    )
+    mode = ["quick", "standard", "strict"][mode_idx]
+
+    print("\n[DataPrep] Dataset overview")
+    print(f"  shape: {df.shape[0]} rows × {df.shape[1]} cols")
+    # show only top 12 cols to avoid spam on wide data; user can inspect CSV separately
+    for i, c in enumerate(df.columns[:12]):
+        print(f"  - {c} | dtype={df[c].dtype} | missing={pct(df[c].isna().mean())}%")
+    if df.shape[1] > 12:
+        print(f"  ... ({df.shape[1]-12} more columns)")
+
+    protect_raw = input("\n[DataPrep] Protect columns from being dropped? (comma-separated, optional): ").strip()
+    protected_cols = {p.strip() for p in protect_raw.split(",") if p.strip()} if protect_raw else set()
+
+    threshold_str = input("\n[DataPrep] Drop columns with missing% >= ? (default 60): ").strip()
+    high_missing_threshold = 0.60 if not threshold_str else max(0.0, min(1.0, float(threshold_str) / 100.0))
+
+    drop_dupes_default = (mode == "quick")
+    drop_dupes = ask_yes_no("\n[DataPrep] Drop duplicate rows?", default=drop_dupes_default)
+
+    cleaned = df.copy()
+    input_shape = list(cleaned.shape)
+    if drop_dupes:
+        cleaned = cleaned.drop_duplicates()
+
+    # ---------- Data quality scan (summary) ----------
+    # Keep it short; only print details if there are issues.
+    quality = {"column_flags": {}, "dataset_flags": {}}
+    if cleaned.duplicated().any():
+        quality["dataset_flags"]["has_duplicate_rows"] = True
+        quality["dataset_flags"]["duplicate_rows_count"] = int(cleaned.duplicated().sum())
+
+    for c in cleaned.columns:
+        s = cleaned[c]
+        flags = []
+        if s.dtype == "object":
+            ss = s.dropna().astype(str)
+            if not ss.empty:
+                if (ss.str.contains(r"\s+$|^\s+", regex=True).mean() >= 0.05):
+                    flags.append("whitespace_in_values")
+                if ss.str.contains(r"[,$₩€£¥]|원|달러|krw|usd|eur|gbp|jpy", case=False, regex=True).any():
+                    flags.append("currency_or_unit_tokens")
+                if ss.str.contains(",", regex=False).any():
+                    flags.append("commas_in_values")
+                if ss.str.contains("%", regex=False).any():
+                    flags.append("percent_values")
+
+                # date-ish patterns
+                date_pat_rate = float(ss.str.contains(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", regex=True).mean())
+                slash_pat_rate = float(ss.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$").mean())
+                if date_pat_rate >= 0.30 or slash_pat_rate >= 0.30:
+                    flags.append("date_like_strings")
+
+                nunique = int(s.nunique(dropna=True))
+                if len(s) > 0 and (nunique / max(len(s), 1) >= 0.50) and nunique >= 50:
+                    flags.append("high_cardinality_text_or_id_like")
+
+        if flags:
+            quality["column_flags"][c] = flags
+
+    if quality["column_flags"]:
+        print("\n[DataPrep] Data quality scan: issues detected in", len(quality["column_flags"]), "column(s).")
+        if mode != "quick" and ask_yes_no("[DataPrep] Show the list of flagged columns now?", default=True):
+            for c, fl in quality["column_flags"].items():
+                print(f"  - {c}: {', '.join(fl)}")
+    else:
+        print("\n[DataPrep] Data quality scan: no obvious formatting issues detected.")
+
+    # ---------- Drop candidates (batch) ----------
+    n_rows = int(cleaned.shape[0])
+
+    id_candidates = []
+    constant_candidates = []
+    high_missing_candidates = []
+
+    # confidence-ish scoring: high if name looks like id + near-unique
+    def _id_confidence(col: str, s: pd.Series) -> float:
+        ss = s.dropna()
+        nunique = int(ss.nunique(dropna=True))
+        uniq_ratio = nunique / max(n_rows, 1)
+        name_bonus = 0.35 if re.search(r"\b(id|uuid|guid|user|account|customer|record)\b", str(col), re.I) else 0.0
+        seq_bonus = 0.25 if (pd.api.types.is_numeric_dtype(ss) and len(ss) >= 50 and ss.is_monotonic_increasing) else 0.0
+        return min(1.0, (uniq_ratio * 0.7) + name_bonus + seq_bonus)
+
+    for c in cleaned.columns:
+        if c in protected_cols:
+            continue
+        s = cleaned[c]
+        mr = float(s.isna().mean())
+        if mr >= high_missing_threshold:
+            high_missing_candidates.append(c)
+        if is_constant_like(s):
+            constant_candidates.append(c)
+        if is_id_like(c, s, n_rows):
+            id_candidates.append(c)
+
+    # De-dup in case overlap
+    id_candidates = [c for c in id_candidates if c not in protected_cols]
+    constant_candidates = [c for c in constant_candidates if c not in protected_cols]
+    high_missing_candidates = [c for c in high_missing_candidates if c not in protected_cols]
+
+    drop_cols = set()
+
+    def _batch_drop(prompt_title: str, cols: List[str], default: bool) -> None:
+        nonlocal drop_cols
+        if not cols:
+            return
+        print(f"\n[DataPrep] {prompt_title}: {len(cols)} column(s)")
+        if mode != "quick":
+            print("  " + ", ".join(cols[:12]) + ("" if len(cols) <= 12 else f", ... (+{len(cols)-12} more)"))
+        do_drop = ask_yes_no(f"[DataPrep] Drop ALL {prompt_title.lower()} columns?", default=default)
+        if do_drop:
+            keep_raw = input("[DataPrep] Any columns to KEEP from this drop list? (comma-separated, optional): ").strip()
+            keep = {k.strip() for k in keep_raw.split(",") if k.strip()} if keep_raw else set()
+            drop_cols |= set([c for c in cols if c not in keep])
+
+    # Defaults by mode
+    _batch_drop("ID-like", id_candidates, default=(mode in {"quick", "standard"}))
+    _batch_drop("Constant-like", constant_candidates, default=(mode in {"quick", "standard"}))
+    _batch_drop(f"High-missing (>= {int(high_missing_threshold*100)}%)", high_missing_candidates, default=False)
+
+    if drop_cols:
+        cleaned = cleaned.drop(columns=[c for c in drop_cols if c in cleaned.columns], errors="ignore")
+
+    # ---------- Normalize text ----------
+    obj_cols = [c for c in cleaned.columns if cleaned[c].dtype == "object"]
+    normalize_default = True if mode in {"quick", "standard"} else False
+    normalize_text = bool(obj_cols) and ask_yes_no(f"\n[DataPrep] Normalize {len(obj_cols)} text columns (strip spaces)?", default=normalize_default)
+    if normalize_text:
+        for c in obj_cols:
+            cleaned[c] = normalize_text_series(cleaned[c])
+
+    # ---------- Numeric parsing (batch) ----------
+    coerced_numeric_cols: List[str] = []
+    percent_as_fraction = True
+    numeric_candidates: List[Tuple[str, float]] = []
+    for c in obj_cols:
+        flag, rate, _ = messy_numeric_like_object(cleaned[c], percent_as_fraction=True)
+        if flag:
+            numeric_candidates.append((c, rate))
+    numeric_candidates.sort(key=lambda t: t[1], reverse=True)
+
+    numeric_parse_applied = False
+    if numeric_candidates:
+        print(f"\n[DataPrep] Numeric-like text columns detected: {len(numeric_candidates)}")
+        if mode != "quick":
+            shown = ", ".join([f"{c}({pct(r)}%)" for c, r in numeric_candidates[:10]])
+            print("  " + shown + ("" if len(numeric_candidates) <= 10 else f", ... (+{len(numeric_candidates)-10} more)"))
+        default_numeric = (mode in {"quick", "standard"})
+        if ask_yes_no("[DataPrep] Convert these numeric-like text columns to numeric (handles commas/currency/units/%)?", default=default_numeric):
+            any_pct = any(cleaned[c].astype(str).str.contains("%", na=False).any() for c, _ in numeric_candidates)
+            if any_pct:
+                percent_as_fraction = ask_yes_no("[DataPrep] Convert '12%' -> 0.12 (recommended)?", default=True)
+
+            exclude_raw = input("[DataPrep] Any columns to EXCLUDE from numeric parsing? (comma-separated, optional): ").strip()
+            exclude = {e.strip() for e in exclude_raw.split(",") if e.strip()} if exclude_raw else set()
+
+            # quick mode: auto-apply only high parse-rate cols unless user insists
+            for c, rate in numeric_candidates:
+                if c in exclude:
+                    continue
+                if mode == "quick" and rate < 0.95:
+                    continue
+                parsed, _, _ = parse_messy_numeric_series(cleaned[c], percent_as_fraction=percent_as_fraction)
+                cleaned[c] = parsed
+                coerced_numeric_cols.append(c)
+            numeric_parse_applied = True
+
+    # ---------- Date parsing (batch) ----------
+    parsed_date_cols: List[str] = []
+    dayfirst_cols: List[str] = []
+    store_dates_as_iso = True
+    date_candidates: List[Tuple[str, float, bool]] = []
+    for c in obj_cols:
+        if c in coerced_numeric_cols:
+            continue
+        flag, rate, info = date_like_object(cleaned[c], dayfirst=False)
+        if flag:
+            date_candidates.append((c, rate, bool(info.get("ambiguous", False))))
+    date_candidates.sort(key=lambda t: t[1], reverse=True)
+
+    date_parse_applied = False
+    if date_candidates:
+        print(f"\n[DataPrep] Date-like text columns detected: {len(date_candidates)}")
+        if mode != "quick":
+            shown = ", ".join([f"{c}({pct(r)}%)" for c, r, _ in date_candidates[:10]])
+            print("  " + shown + ("" if len(date_candidates) <= 10 else f", ... (+{len(date_candidates)-10} more)"))
+        default_date = (mode in {"quick", "standard"})
+        if ask_yes_no("[DataPrep] Parse these date-like columns as dates?", default=default_date):
+            store_dates_as_iso = ask_yes_no("[DataPrep] Store parsed dates as ISO strings in cleaned.csv? (recommended)", default=True)
+
+            # If ambiguous slash dates exist, ask once (standard/quick). Strict asks per column.
+            global_dayfirst = False
+            any_amb = any(amb for _, _, amb in date_candidates)
+            if any_amb and mode != "strict":
+                global_dayfirst = ask_yes_no(
+                    "[DataPrep] Found many ambiguous slash dates (like 01/02/2026). Treat as day-first? (dd/mm/yyyy)",
+                    default=True,
+                )
+
+            exclude_raw = input("[DataPrep] Any columns to EXCLUDE from date parsing? (comma-separated, optional): ").strip()
+            exclude = {e.strip() for e in exclude_raw.split(",") if e.strip()} if exclude_raw else set()
+
+            for c, _, amb in date_candidates:
+                if c in exclude:
+                    continue
+
+                dayfirst = False
+                if amb:
+                    if mode == "strict":
+                        dayfirst = ask_yes_no(
+                            f"[DataPrep] Column '{c}' seems ambiguous. Treat as day-first? (dd/mm/yyyy)",
+                            default=True,
+                        )
+                    else:
+                        dayfirst = global_dayfirst
+
+                dt = pd.to_datetime(cleaned[c].astype(str).str.strip(), errors="coerce", infer_datetime_format=True, dayfirst=dayfirst)
+                if store_dates_as_iso:
+                    has_time = dt.dropna().astype(str).str.contains(r":\d{2}", regex=True).any()
+                    fmt = "%Y-%m-%d %H:%M:%S" if has_time else "%Y-%m-%d"
+                    cleaned[c] = dt.dt.strftime(fmt)
+                else:
+                    cleaned[c] = dt
+
+                parsed_date_cols.append(c)
+                if dayfirst:
+                    dayfirst_cols.append(c)
+            date_parse_applied = True
+
+    # ---------- Save outputs ----------
+    cleaned_csv = outdir / "cleaned.csv"
+    cleaned.to_csv(cleaned_csv, index=False)
+
+    cleaning_report = {
+        "input_csv": csv_path,
+        "output_csv": str(cleaned_csv),
+        "input_shape": input_shape,
+        "output_shape": list(cleaned.shape),
+        "mode": mode,
+        "data_quality_flags": quality,
+        "protected_cols": sorted(list(protected_cols)),
+        "high_missing_threshold": high_missing_threshold,
+        "drop_duplicates": bool(drop_dupes),
+        "dropped_columns": sorted(list(drop_cols)),
+        "normalize_text": bool(normalize_text),
+        "numeric_parse": {
+            "enabled": bool(numeric_parse_applied),
+            "cols": coerced_numeric_cols,
+            "percent_as_fraction": bool(percent_as_fraction),
+        },
+        "date_parse": {
+            "enabled": bool(date_parse_applied),
+            "cols": parsed_date_cols,
+            "dayfirst_cols": dayfirst_cols,
+            "store_as_iso": bool(store_dates_as_iso),
+        },
+    }
+    report_path.write_text(json.dumps(cleaning_report, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    cleaning_config = {
+        "high_missing_threshold": high_missing_threshold,
+        "protected_cols": sorted(list(protected_cols)),
+        "drop_duplicates": bool(drop_dupes),
+        "drop_cols": sorted(list(drop_cols)),
+        "normalize_text": bool(normalize_text),
+        "numeric_parse": {
+            "cols": coerced_numeric_cols,
+            "percent_as_fraction": bool(percent_as_fraction),
+        },
+        "date_parse": {
+            "cols": parsed_date_cols,
+            "dayfirst_cols": dayfirst_cols,
+            "store_as_iso": bool(store_dates_as_iso),
+        },
+    }
+    config_path.write_text(json.dumps(cleaning_config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # steps script
+    steps = [
+        "# cleaning_steps.py (auto-generated)",
+        "import pandas as pd",
+        "import numpy as np",
+        "import re",
+        "",
+        f"df = pd.read_csv({csv_path!r})",
+    ]
+    if drop_dupes:
+        steps.append("df = df.drop_duplicates()")
+    if drop_cols:
+        steps.append(f"df = df.drop(columns={sorted(list(drop_cols))!r}, errors='ignore')")
+    if normalize_text:
+        steps.append("# normalize text columns (strip spaces)")
+        steps.append("for c in df.select_dtypes(include=['object']).columns:")
+        steps.append("    df[c] = df[c].apply(lambda x: x.strip() if isinstance(x, str) else x)")
+    if coerced_numeric_cols:
+        steps.append("# numeric parsing for messy numeric strings")
+        steps.append(f"_PCT_AS_FRACTION = {percent_as_fraction!r}")
+        steps.append("_CURRENCY_TOKENS = ['₩','원','krw','won','$','usd','dollar','달러','€','eur','£','gbp','¥','jpy','엔']")
+        steps.append("def _clean_num(x: str) -> str:")
+        steps.append("    s = x.strip()")
+        steps.append("    if not s: return s")
+        steps.append("    neg = False")
+        steps.append("    if s.startswith('(') and s.endswith(')'):")
+        steps.append("        neg = True; s = s[1:-1].strip()")
+        steps.append("    low = s.lower()")
+        steps.append("    for tok in _CURRENCY_TOKENS:")
+        steps.append("        low = low.replace(tok.lower(), '')")
+        steps.append("    s = low.replace(',', '').replace(' ', '')")
+        steps.append("    is_pct = '%' in s")
+        steps.append("    s = s.replace('%','')")
+        steps.append("    s = re.sub(r'[^0-9+\\-\\.]', '', s)")
+        steps.append("    if neg and s and not s.startswith('-'): s='-'+s")
+        steps.append("    if is_pct and _PCT_AS_FRACTION and s: return s+'__PCT__'")
+        steps.append("    return s")
+        steps.append("def _to_num(v):")
+        steps.append("    if pd.isna(v): return np.nan")
+        steps.append("    st = _clean_num(str(v))")
+        steps.append("    if st.endswith('__PCT__'):")
+        steps.append("        base = st[:-7]")
+        steps.append("        num = pd.to_numeric(base, errors='coerce')")
+        steps.append("        return (num/100.0) if pd.notna(num) else np.nan")
+        steps.append("    return pd.to_numeric(st, errors='coerce')")
+        for c in coerced_numeric_cols:
+            steps.append(f"df[{c!r}] = df[{c!r}].apply(_to_num)")
+    if parsed_date_cols:
+        steps.append("# date parsing")
+        steps.append(f"_STORE_AS_ISO = {store_dates_as_iso!r}")
+        steps.append(f"_DAYFIRST_COLS = {dayfirst_cols!r}")
+        steps.append(f"for c in {parsed_date_cols!r}:")
+        steps.append("    dt = pd.to_datetime(df[c].astype(str).str.strip(), errors='coerce', infer_datetime_format=True, dayfirst=(c in _DAYFIRST_COLS))")
+        steps.append("    if _STORE_AS_ISO:")
+        steps.append("        has_time = dt.dropna().astype(str).str.contains(r':\\d{2}', regex=True).any()")
+        steps.append("        fmt = '%Y-%m-%d %H:%M:%S' if has_time else '%Y-%m-%d'")
+        steps.append("        df[c] = dt.dt.strftime(fmt)")
+        steps.append("    else:")
+        steps.append("        df[c] = dt")
+    steps.append(f"df.to_csv({str(cleaned_csv)!r}, index=False)")
+    steps_path.write_text("\n".join(steps) + "\n", encoding="utf-8")
+
+    print("\n[DataPrep] Saved cleaned CSV:", cleaned_csv)
+    return cleaned, cleaned_csv, cleaning_report
+
+
 def main() -> None:
     print("=== ML Workflow Wizard (DataPrep -> AutoML) ===")
 
@@ -460,60 +1098,7 @@ def main() -> None:
 
     # ------------------ DataPrep ------------------
     outdir = Path("prep_out")
-    outdir.mkdir(parents=True, exist_ok=True)
-
-    print("\n[DataPrep] Dataset overview")
-    print(f"  shape: {df.shape[0]} rows × {df.shape[1]} cols")
-    for c in df.columns:
-        print(f"  - {c} | dtype={df[c].dtype} | missing={pct(df[c].isna().mean())}%")
-
-    threshold_str = input("\n[DataPrep] Drop columns with missing% >= ? (default 60): ").strip()
-    high_missing_threshold = 0.60 if not threshold_str else max(0.0, min(1.0, float(threshold_str)/100.0))
-
-    drop_cols: List[str] = []
-    for c in df.columns:
-        if is_id_like(c, df[c], df.shape[0]) and ask_yes_no(f"[DataPrep] Drop ID-like '{c}'?", default=True):
-            drop_cols.append(c)
-
-    for c in df.columns:
-        if c in drop_cols:
-            continue
-        if is_constant_like(df[c]) and ask_yes_no(f"[DataPrep] Drop constant-like '{c}'?", default=True):
-            drop_cols.append(c)
-
-    for c in df.columns:
-        if c in drop_cols:
-            continue
-        mr = float(df[c].isna().mean())
-        if mr >= high_missing_threshold and ask_yes_no(f"[DataPrep] Drop high-missing '{c}' ({pct(mr)}%)?", default=False):
-            drop_cols.append(c)
-
-    cleaned = df.drop(columns=[c for c in drop_cols if c in df.columns]).copy()
-
-    obj_cols = [c for c in cleaned.columns if cleaned[c].dtype == "object"]
-    if obj_cols and ask_yes_no(f"[DataPrep] Normalize {len(obj_cols)} text columns (strip spaces)?", default=True):
-        for c in obj_cols:
-            cleaned[c] = normalize_text_series(cleaned[c])
-
-    # numeric coercion
-    for c in obj_cols:
-        flag, rate = numeric_like_object(cleaned[c])
-        if flag and ask_yes_no(f"[DataPrep] Coerce '{c}' to numeric? (parse_rate={pct(rate)}%)", default=True):
-            cleaned[c] = pd.to_numeric(cleaned[c], errors="coerce")
-
-    cleaned_csv = outdir / "cleaned.csv"
-    cleaned.to_csv(cleaned_csv, index=False)
-
-    (outdir / "cleaning_report.json").write_text(json.dumps({
-        "input_csv": csv_path,
-        "output_csv": str(cleaned_csv),
-        "dropped_columns": drop_cols,
-        "high_missing_threshold": high_missing_threshold,
-        "input_shape": list(df.shape),
-        "output_shape": list(cleaned.shape),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
-
-    print("\n[DataPrep] Saved cleaned CSV:", cleaned_csv)
+    cleaned, cleaned_csv, _cleaning_report = run_dataprep_optimized(df, csv_path, outdir)
 
     # ------------------ AutoML ------------------
     df2 = cleaned
@@ -524,7 +1109,6 @@ def main() -> None:
     t_idx = ask_choice("\n[AutoML] Select target column:", cols, default_index=max(0, len(cols)-1))
     target = cols[t_idx]
     y = df2[target]
-
 
     auto_remove = detect_outcome_like_columns(df2, target)
     if auto_remove:
@@ -590,10 +1174,10 @@ def main() -> None:
 
     elif split_mode == "group":
         candidates = [c for c in df2.columns if c != target]
-        # pick a reasonable default (id-like), otherwise first column
+        # default: any column that looks like an id by name
         default_g = 0
         for i, c in enumerate(candidates):
-            if is_id_like(c):
+            if re.search(r"\b(id|uuid|guid|user|account|customer|record)\b", str(c), re.I):
                 default_g = i
                 break
         g_idx = ask_choice("\n[AutoML] Select group column (to prevent group leakage):", candidates, default_index=default_g)
@@ -685,7 +1269,7 @@ def main() -> None:
         test_score = score_classification(y_test, pred, metric, y_proba=y_proba, labels=getattr(best_est, "classes_", None))
     else:
         test_score = score_regression(y_test, pred, metric)
-    # ---- Full evaluation summary (independent of tuning metric) ----
+
     full_eval = full_evaluation_summary(task, best_est, X_test, y_test)
 
     rep = Report(
@@ -703,7 +1287,6 @@ def main() -> None:
         split_details=split_details,
     )
 
-    
     # ---- Stability evaluation (optional) ----
     if ask_yes_no("\n[AutoML] Run stability evaluation (cross-validated best pipeline)?", default=False):
         if split_mode == "random":
