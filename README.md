@@ -1,5 +1,5 @@
 
-# ML Workflow Wizard
+# ML Workflow Wizard (On going project)
 
 ### Reproducible Supervised Machine Learning CLI (DataPrep → AutoML → Evaluation)
 
